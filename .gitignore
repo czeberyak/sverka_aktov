@@ -1,22 +1,5 @@
-# Виртуальное окружение
-.venv/
-env/
-venv/
-
-# Кэш Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-
-# Среда разработки
-.vscode/
-.idea/
-
-# Сгенерированные файлы и отчеты (по желанию, но обычно их не пушат)
-output/output.xlsx
-output/Отчёт_сверки.xlsx
-
-# Переменные окружения (чтобы случайно не слить ключи Anthropic/OpenRouter)
-.env
+.pytest_cache/
+output/*.xlsx
+!output/.gitkeep

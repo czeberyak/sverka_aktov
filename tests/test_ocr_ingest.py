@@ -1,15 +1,27 @@
 # -*- coding: utf-8 -*-
-"""Тестируем только детерминированную часть src/ocr_ingest.py — разбор и
-фильтрацию TSV-ответа модели. Сам вызов API мокается: реальный вызов
-Anthropic не детерминирован и не должен жить в юнит-тестах."""
+"""Тестируем детерминированную часть src/ocr_ingest.py — разбор/фильтрацию
+ответа модели и выбор провайдера. Сеть не дёргаем: вместо реального
+Claude/OpenRouter передаём фейковый объект с .ask_image(...)."""
 import unittest
-from unittest.mock import patch
 import tempfile
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.ocr_ingest import extract_pdf_to_tsv
+from src.ocr_ingest import extract_pdf_to_tsv, build_provider, render_pdf_pages
+
+
+class FakeProvider:
+    """Минимальная реализация контракта .ask_image(path, prompt) -> str."""
+    name = "fake"
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def ask_image(self, image_path, prompt):
+        self.calls.append((image_path, prompt))
+        return self.responses.pop(0) if self.responses else ""
 
 
 FAKE_PAGE_A = (
@@ -26,48 +38,79 @@ FAKE_PAGE_B = (
 
 
 class TestOcrIngest(unittest.TestCase):
-    @patch("src.ocr_ingest.render_pdf_pages")
-    @patch("src.ocr_ingest._call_claude_vision")
-    def test_side_a_filters_malformed_lines(self, mock_call, mock_render):
-        mock_render.return_value = ["fake_page_1.png"]
-        mock_call.return_value = FAKE_PAGE_A
+    def _fake_render(self, monkeypatch_target, n_pages=1):
+        import src.ocr_ingest as mod
+        original = mod.render_pdf_pages
+        mod.render_pdf_pages = lambda pdf_path, out_dir, dpi=300: [f"fake_page_{i}.png" for i in range(n_pages)]
+        self.addCleanup(setattr, mod, "render_pdf_pages", original)
+
+    def test_side_a_filters_malformed_lines_via_fake_provider(self):
+        self._fake_render(self)
+        provider = FakeProvider([FAKE_PAGE_A])
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "side_a.tsv")
-            n = extract_pdf_to_tsv("dummy.pdf", "A", out)
+            n = extract_pdf_to_tsv("dummy.pdf", "A", out, provider=provider)
             self.assertEqual(n, 2)  # только 2 валидные строки с 4 табуляциями (5 колонок)
             with open(out, encoding="utf-8") as fh:
                 content = fh.read()
             self.assertIn("acc_date\tdoc_text\tsum_doc\tmy_debit\tmy_credit", content)
             self.assertNotIn("случайный текст", content)
+            self.assertEqual(len(provider.calls), 1)  # 1 страница -> 1 вызов
 
-    @patch("src.ocr_ingest.render_pdf_pages")
-    @patch("src.ocr_ingest._call_claude_vision")
-    def test_side_b_filters_malformed_lines(self, mock_call, mock_render):
-        mock_render.return_value = ["fake_page_1.png"]
-        mock_call.return_value = FAKE_PAGE_B
+    def test_side_b_filters_malformed_lines_via_fake_provider(self):
+        self._fake_render(self)
+        provider = FakeProvider([FAKE_PAGE_B])
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "side_b.tsv")
-            n = extract_pdf_to_tsv("dummy.pdf", "B", out)
+            n = extract_pdf_to_tsv("dummy.pdf", "B", out, provider=provider)
             self.assertEqual(n, 1)
             with open(out, encoding="utf-8") as fh:
                 content = fh.read()
             self.assertIn("acc_date\tdoc_text\tdebit\tcredit", content)
             self.assertNotIn("мусорная", content)
 
-    @patch("src.ocr_ingest.render_pdf_pages")
-    @patch("src.ocr_ingest._call_claude_vision")
-    def test_output_is_parseable_by_pipeline(self, mock_call, mock_render):
+    def test_output_is_parseable_by_pipeline(self):
         """Круговой тест: то, что пишет ocr_ingest, должно без ошибок
         читаться той же функцией, что читает штатные data/raw/*.tsv."""
         from src.pipeline import load_side_a
-        mock_render.return_value = ["fake_page_1.png"]
-        mock_call.return_value = FAKE_PAGE_A
+        self._fake_render(self)
+        provider = FakeProvider([FAKE_PAGE_A])
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "side_a.tsv")
-            extract_pdf_to_tsv("dummy.pdf", "A", out)
+            extract_pdf_to_tsv("dummy.pdf", "A", out, provider=provider)
             cards = load_side_a(out)
             self.assertEqual(len(cards), 2)
             self.assertEqual(cards[1].document_number_normalized, "172")
+
+    def test_multi_page_calls_provider_once_per_page(self):
+        self._fake_render(self, n_pages=3)
+        provider = FakeProvider([FAKE_PAGE_A, "", FAKE_PAGE_B.replace("\t-\t", "\t-\t")])
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "side_a.tsv")
+            extract_pdf_to_tsv("dummy.pdf", "A", out, provider=provider)
+            self.assertEqual(len(provider.calls), 3)
+
+    def test_build_provider_rejects_unknown_name(self):
+        with self.assertRaises(ValueError):
+            build_provider("chatgpt")
+
+    def test_build_provider_openrouter_requires_api_key(self):
+        old = os.environ.pop("OPENROUTER_API_KEY", None)
+        try:
+            with self.assertRaises(RuntimeError):
+                build_provider("openrouter")
+        finally:
+            if old is not None:
+                os.environ["OPENROUTER_API_KEY"] = old
+
+    def test_build_provider_claude_requires_api_key(self):
+        old = os.environ.pop("ANTHROPIC_API_KEY", None)
+        try:
+            with self.assertRaises(RuntimeError):
+                build_provider("claude")
+        finally:
+            if old is not None:
+                os.environ["ANTHROPIC_API_KEY"] = old
 
 
 if __name__ == "__main__":
